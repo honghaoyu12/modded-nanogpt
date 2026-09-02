@@ -1289,6 +1289,7 @@ def _evaluate_current_batch(inputs, targets):
     return float(loss_value.item())
 
 
+@torch.no_grad()
 def _component_probe(pre_update_snapshots, inputs, targets):
     # The ordinary update has already happened. Temporarily retain one family at
     # W1 and restore the other to W0; exact post-update tensors are restored in

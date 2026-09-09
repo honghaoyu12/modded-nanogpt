@@ -65,6 +65,11 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--control", action="store_true", help="enable adaptive Muon multiplier control")
 parser.add_argument("--control-fixed-multiplier", type=float, default=None, help="probe with a fixed Muon multiplier")
 parser.add_argument("--control-period", type=int, default=5, help="optimizer steps between same-batch probes")
+parser.add_argument(
+    "--control-cadence-schedule",
+    default=None,
+    help="optional comma-separated probe cadence schedule, e.g. 0:5,1800:20,2400:50",
+)
 parser.add_argument("--control-multiplier-init", type=float, default=1.0)
 parser.add_argument("--control-multiplier-min", type=float, default=0.5)
 parser.add_argument("--control-multiplier-max", type=float, default=1.5)
@@ -97,6 +102,48 @@ parser.add_argument("--control-rho-deadband", type=float, default=0.0, help="ign
 parser.add_argument("--output-root", default=os.environ.get("PR328_OUTPUT_ROOT", "/public/honghao/controlled_optimizer_runtime/modded_nanogpt_pr328_full_control"))
 parser.add_argument("--data-root", default=os.environ.get("PR328_DATA_ROOT", "data/fineweb10B"))
 args = parser.parse_args()
+
+
+def _parse_control_cadence_schedule(spec):
+    if spec is None:
+        return None
+    entries = []
+    for raw_entry in spec.split(","):
+        entry = raw_entry.strip()
+        if not entry or ":" not in entry:
+            raise ValueError(
+                "control cadence schedule must use comma-separated start_step:period entries"
+            )
+        raw_start, raw_period = entry.split(":", 1)
+        try:
+            start = int(raw_start)
+            period = int(raw_period)
+        except ValueError as exc:
+            raise ValueError(
+                "control cadence schedule contains a non-integer start or period"
+            ) from exc
+        if start < 0 or period <= 0:
+            raise ValueError("control cadence schedule requires start >= 0 and period > 0")
+        entries.append((start, period))
+    if not entries or entries[0][0] != 0:
+        raise ValueError("control cadence schedule must start at step 0")
+    if any(current[0] <= previous[0] for previous, current in zip(entries, entries[1:])):
+        raise ValueError("control cadence schedule start steps must be strictly increasing")
+    return tuple(entries)
+
+
+CONTROL_CADENCE_SCHEDULE = _parse_control_cadence_schedule(args.control_cadence_schedule)
+
+
+def _control_period_for_step(step):
+    if CONTROL_CADENCE_SCHEDULE is None:
+        return args.control_period
+    period = CONTROL_CADENCE_SCHEDULE[0][1]
+    for start, candidate_period in CONTROL_CADENCE_SCHEDULE:
+        if step < start:
+            break
+        period = candidate_period
+    return period
 
 
 SEED = args.seed
@@ -974,6 +1021,8 @@ print0(f"Using radial_outward_scale={RADIAL_OUTWARD_SCALE}")
 print0(f"Using radial_inward_scale={RADIAL_INWARD_SCALE}")
 print0(f"Using control_handoff_step={args.control_handoff_step}")
 print0(f"Using control_handoff_ramp_steps={args.control_handoff_ramp_steps}")
+print0(f"Using control_period={args.control_period}")
+print0(f"Using control_cadence_schedule={CONTROL_CADENCE_SCHEDULE}")
 print0("Dampened radial gradient component is applied before the u/w floor; post-step radius is corrected to remove tangent drift.")
 print0("="*100)
 
@@ -1203,6 +1252,8 @@ for p in model.parameters():
 # start the clock
 training_time = 0
 _tailema = None   # (A) Tail-EMA buffer: one fp32 tensor per non-embed param; lazy-init at TAILEMA_START
+next_probe_step = 0
+probe_count = 0
 dist.barrier()
 t0 = time.perf_counter()
 for step in range(train_steps + 1):
@@ -1254,14 +1305,23 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
+    active_control_period = _control_period_for_step(step)
+    if CONTROL_CADENCE_SCHEDULE is None:
+        cadence_due = step % args.control_period == 0
+    else:
+        cadence_due = step >= next_probe_step
     probe_this_step = (
         CONTROL_ENABLED
-        and step % args.control_period == 0
+        and cadence_due
         and (
             args.control_handoff_step is None
             or step < args.control_handoff_step
         )
     )
+    if probe_this_step:
+        probe_count += 1
+        if CONTROL_CADENCE_SCHEDULE is not None:
+            next_probe_step = step + active_control_period
     loss_before_probe_sum = None
     # accumulate across microbatches in case we are running with fewer than 8 gpus
     assert len(inputs) % mbs == 0
@@ -1310,6 +1370,8 @@ for step in range(train_steps + 1):
         print0(
             "control "
             + " ".join(f"{key}:{value}" for key, value in control_stats.items())
+            + f" control_period:{active_control_period}"
+            + f" probe_count:{probe_count}"
             + f" predicted_total:{control_diagnostics['predicted_decrease_total']}"
             + f" predicted_muon:{control_diagnostics['predicted_decrease_muon']}"
             + f" predicted_adamw:{control_diagnostics['predicted_decrease_adamw']}"
